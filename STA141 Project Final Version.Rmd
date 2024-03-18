@@ -1,0 +1,686 @@
+---
+title: "STA 141 Final Project"
+author: "Yihui Zhu 919644670"
+date: " 2024-3-17 "
+output: html_document
+---
+
+# Abstract
+The motivation of this project is to predict the race's feedback type based on their neural activity data and given stimuli types in each trial.
+
+This dataset involves 18 sessions containing 4 mice, where the stimuli types, numbers of spikes of neurons in the visual cortex across observational time, neurons' brain areas, and observational time, feedback types are recorded.
+
+The challenging thing is that different neural activities are recorded in different sessions, making it impossible to feed the neurons' activity data into the prediction model directly.
+
+I overcome these challenges by constructing potential factors based on original neural activity data, which can be reasonably calculated based on different neural data.
+
+I construct two models based on different factors and compare their performance.
+
+The results from the test data show that benchmark naive data model (model 1) has slightly better predicting performance than my integrated model (Model 2).
+
+# 1. Introduction
+
+This project analyzed a subset of data from the experiment conducted by Steinmetz et al. in 2019. Ten mice were involved in 39 treatment courses. During these processes, visual stimuli were presented to mice on dual screens, and their neural activity towards these stimuli was recorded. Mice made decisions based on visual stimuli, used front paw-controlled wheels, and received corresponding feedback. Specifically, the focus of this study is on spike training data from the start of stimulation to 0.4 seconds after stimulation, involving four mice: Corey, Frossman, and therefore, Ledelberg. This analysis aims to gain a deeper understanding of the neural mechanisms involved in the decision-making process of visual stimuli.
+
+The following parts are organized as follows: exploratory analysis is contained in Part 2, involving session-level and trial-level analysis. Part 3 involves the data integration process, where key predictors are constructed. Two prediction models are illustrated in Part 4, as well as performance analysis in Part 5. In Part 6, I draw conclusions and discuss further investigations.
+
+# 2. Exploratory Analysis
+
+```{r, message = FALSE}
+suppressWarnings(library(tidyverse))
+suppressWarnings(library(dplyr))
+suppressWarnings(library(caret)) 
+suppressWarnings(library(ROCR))
+suppressWarnings(library(knitr))
+suppressWarnings(library(kableExtra))
+suppressWarnings(library(MASS))
+library(readr)
+library(pROC)
+
+
+```
+
+## 2.1 Data Structure
+
+------------------------------------------------------------------------
+
+First, I read these 18 RDS files, each corresponding to a session. Each session contains a specific mouse (`mouse_name`) conducts a series of trials on a specific date (`date_exp`).
+
+```{r, echo=TRUE, eval=TRUE}
+
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./Data/session',i,'.rds',sep=''))
+   #print(session[[i]]$mouse_name)
+   #print(session[[i]]$date_exp)
+  
+}
+
+summary(session[[1]])
+```
+
+Take session 1 as an example. In session 1, the dataset is built up by the components listed above. It shows that there are 114 trials in session 1. 734 neurons are distributed across different brain areas.
+
+```{r, echo=FALSE}
+print(dim(session[[1]]$spks[[1]]))
+print(length(session[[1]]$time[[1]]))
+```
+
+40 observation points are set within the observation window. For each trial, `spks` is a 734 \* 40 matrix, representing the activity levels of 734 neurons across 40 observation points.
+
+```{r, echo=FALSE}
+n_session <- length(session)
+
+n_trial <- sum(sapply(session, function(x) length(x$feedback_type)))
+n_success <- sum(sapply(session, function(x) sum(x$feedback_type == 1)))
+
+success_rate <- n_success / n_trial
+
+print(paste("Overall Success rate:", success_rate))
+```
+
+The overall success rate of the experiment is about 71%.
+
+## 2.2 Session-level Analysis
+
+```{r, echo=FALSE}
+n.session=length(session)
+
+# in library tidyverse
+meta <- tibble(
+  mouse_name = rep('name',n.session),
+  date_exp =rep('dt',n.session),
+  n_brain_area = rep(0,n.session),
+  n_neurons = rep(0,n.session),
+  n_trials = rep(0,n.session),
+  success_rate = rep(0,n.session)
+)
+
+
+for(i in 1:n.session){
+  tmp = session[[i]];
+  meta[i,1]=tmp$mouse_name;
+  meta[i,2]=tmp$date_exp;
+  meta[i,3]=length(unique(tmp$brain_area));
+  meta[i,4]=dim(tmp$spks[[1]])[1];
+  meta[i,5]=length(tmp$feedback_type);
+  meta[i,6]=mean(tmp$feedback_type+1)/2;
+}
+
+meta <- meta %>% 
+  rename(
+    `# brain area` = n_brain_area,
+    `# neurons` = n_neurons,
+    `# trials` = n_trials,
+    `success rate` = success_rate
+  )
+
+kable(meta, format = "html", table.attr = "class='table table-striped'", digits = 2, caption = "Summary of the Information Across Sessions")
+```
+
+The table above includes information across all 18 sessions; each row represents the experimental information related to a mouse on a single day.
+
+Some results implied by this table should be highlighted:
+
+-   Different sessions involve different mice.
+
+-   Different neurons are analyzed in different sessions, and they are from the same brain area across different sessions.
+
+-   A different number of trials are conducted in different sessions.
+
+These findings raise the challenge of constructing a unified prediction model leveraging more session data. We cannot incorporate the original data directly as predictors because of the heterogeneity across these sessions.
+
+Let's take a look at Session 18.
+
+```{r, echo=FALSE}
+n_obs = length(session[[18]]$feedback_type)
+
+dat = tibble(
+    feedback_type = as.factor(session[[18]]$feedback_type),
+    decision = rep('name', n_obs),
+    avg_spikes = rep(0, n_obs)
+)
+
+for (i in 1:n_obs){
+    # decision 
+    if (session[[18]]$contrast_left[i] > session[[18]]$contrast_right[i]){
+        dat$decision[i] = '1' 
+    } else if (session[[18]]$contrast_left[i] < session[[18]]$contrast_right[i]){
+        dat$decision[i] = '2' 
+    } else if (session[[18]]$contrast_left[i] == session[[18]]$contrast_right[i] 
+               & session[[18]]$contrast_left[i] == 0){
+        dat$decision[i] = '3' 
+    } else{
+        dat$decision[i] = '4' 
+    }
+    
+    # avg_spks
+    spks.trial = session[[18]]$spks[[i]]
+    total.spikes = apply(spks.trial, 1, sum)
+    dat$avg_spikes[i] = mean(total.spikes)
+}
+
+dat$decision = as.factor(dat$decision)
+summary(dat)
+```
+
+The table above shows the frequency of each type of feedback and decision in session 18.
+
+```{r, echo=FALSE}
+print(length(session[[18]]$brain_area))
+print(length(unique(session[[18]]$brain_area)))
+
+```
+
+1090 neurons in Session 18 are located in 10 brain areas. Here, I calculate the average number of spikes across neurons in each area as the activity level. The factor `average_spike_area`, which computes the average spike count for each brain area in a given trial of a session, will serve as the first predictor. It can represent the overall activity level of neurons for each brain within the observation window, which is related to the decision-making process.
+
+```{r, echo=FALSE}
+average_spike_area<-function(i.t,this_session){
+  spk.trial = this_session$spks[[i.t]]
+  area= this_session$brain_area
+  spk.count=apply(spk.trial,1,sum)
+  spk.average.tapply=tapply(spk.count, area, mean)
+  return(spk.average.tapply)
+  }
+
+
+i.s=18 # indicator for this session
+
+i.t=1 # indicator for this trial 
+# Test the function
+average_spike_area(1,this_session = session[[i.s]])
+```
+
+The output provides the average spike count for each brain area. We can see that the root area has a notably higher average spike count compared to other areas. This suggests that neurons in different brain areas behave differently during the decision-making process.
+
+Next, I will create a dataframe containing the average spike counts for each brain area, feedback type, two contrasts, and trial ID.
+
+```{r, echo=FALSE}
+n.trial=length(session[[i.s]]$feedback_type)
+n.area=length(unique(session[[i.s]]$brain_area ))
+# Alternatively, you can extract these information in the meta that we created before.
+
+# We will create a data frame that contain the average spike counts for each area, feedback type,  the two contrasts, and the trial id
+
+trial.summary =matrix(nrow=n.trial,ncol= n.area+1+2+1)
+for(i.t in 1:n.trial){
+  trial.summary[i.t,]=c(average_spike_area(i.t,this_session = session[[i.s]]),
+                          session[[i.s]]$feedback_type[i.t],
+                        session[[i.s]]$contrast_left[i.t],
+                        session[[i.s]]$contrast_right[i.s],
+                        i.t)
+}
+
+colnames(trial.summary)=c(names(average_spike_area(i.t,this_session = session[[i.s]])), 'feedback', 'left contr.','right contr.','id' )
+
+# Turning it into a data frame
+trial.summary <- as_tibble(trial.summary)
+```
+
+From the average spike counts in each brain area, we can understand which brain regions are most active when stimulated.
+
+```{r, echo=FALSE}
+area.col=rainbow(n=n.area,alpha=0.7)
+# In base R, I usually initiate a blank plot before drawing anything on it
+plot(x=1,y=0, col='white',xlim=c(0,n.trial),ylim=c(0.5,2.5), xlab="Trials",ylab="Average spike counts", main=paste("Spikes per area in Session", i.s))
+
+
+for(i in 1:n.area){
+  lines(y=trial.summary[[i]],x=trial.summary$id,col=area.col[i],lty=2,lwd=1)
+  lines(smooth.spline(trial.summary$id, trial.summary[[i]]),col=area.col[i],lwd=3)
+  }
+legend("topright", 
+  legend = colnames(trial.summary)[1:n.area], 
+  col = area.col, 
+  lty = 1, 
+  cex = 0.8
+)
+```
+
+Root has the highest average spike counts with a slightly fluctuating pattern along the trial axis. CA3, TH, and SNr show significant fluctuating patterns. Different areas have diffferent patterns, and thus factors based on brain area may serve as effective predictors because it may reflect the hetergenity across time.
+
+## 2.3 Trial-level Analysis
+
+Below is the visualization of all neutral activities at the trial level, the data I use for this part is trial 1 and trial 2 of session 18
+
+```{r, echo=FALSE}
+plot.trial<-function(i.t,area, area.col,this_session){
+    
+    spks=this_session$spks[[i.t]];
+    n.neuron=dim(spks)[1]
+    time.points=this_session$time[[i.t]]
+    
+    plot(0,0,xlim=c(min(time.points),max(time.points)),ylim=c(0,n.neuron+1),col='white', xlab='Time (s)',yaxt='n', ylab='Neuron', main=paste('Trial ',i.t, 'feedback', this_session$feedback_type[i.t] ),cex.lab=1.5)
+    for(i in 1:n.neuron){
+        i.a=which(area== this_session$brain_area[i]);
+        col.this=area.col[i.a]
+        
+        ids.spike=which(spks[i,]>0) # find out when there are spikes 
+        if( length(ids.spike)>0 ){
+            points(x=time.points[ids.spike],y=rep(i, length(ids.spike) ),pch='.',cex=2, col=col.this)
+        }
+      
+            
+    }
+    
+legend("topright", 
+  legend = area, 
+  col = area.col, 
+  pch = 16, 
+  cex = 0.8
+  )
+  }
+```
+
+```{r, echo=FALSE, fig.width=8, fig.height=8}
+varname=names(trial.summary);
+area=varname[1:(length(varname)-4)]
+par(mfrow=c(1,2))
+plot.trial(1,area, area.col,session[[i.s]])
+plot.trial(2,area, area.col,session[[i.s]])
+
+par(mfrow=c(1,1))
+```
+
+
+Comparing the graphs of Session 18 trial 1 and trial 2, we can see that TH on trial 2 shows a more clustered pattern than the feedback 1 graph on the right, which might indicate that the average activity level in the TH area can be a good predictor variable when constructing the prediction model because it may reflect the hetergenity across trials.
+
+## 2.3 Alternative Session for Comparison
+
+Now, we take a look at session 1 for further analysis.
+
+```{r, echo=FALSE}
+# Update session indicator to the new session you want to analyze
+i.s.new = 1  
+
+# Update the number of trials for the new session
+n.trial = length(session[[i.s.new]]$feedback_type)
+
+# Update the number of areas for the new session (if it has changed)
+n.area = length(unique(session[[i.s.new]]$brain_area))
+
+# Create a new trial summary for the new session
+trial.summary.new = matrix(nrow = n.trial, ncol = n.area + 1 + 2 + 1)
+for(i.t in 1:n.trial) {
+  trial.summary.new[i.t,] = c(average_spike_area(i.t, this_session = session[[i.s.new]]),
+                              session[[i.s.new]]$feedback_type[i.t],
+                              session[[i.s.new]]$contrast_left[i.t],
+                              session[[i.s.new]]$contrast_right[i.s.new],  # Ensure this references the correct session
+                              i.t)
+}
+
+# Update column names for the new trial summary
+colnames(trial.summary.new) = c(names(average_spike_area(1, this_session = session[[i.s.new]])), 'feedback', 'left contr.', 'right contr.', 'id')
+
+# Convert the matrix to a tibble
+trial.summary.new <- as_tibble(trial.summary.new)
+
+# Plotting for the new session
+area.col = rainbow(n = n.area, alpha = 0.7)
+plot(x = 1, y = 0, col = 'white', xlim = c(0, n.trial), ylim = c(0, 3.6), xlab = "Trials", ylab = "Average spike counts", main = paste("Spikes per area in Session", i.s.new))
+
+for(i in 1:n.area) {
+  lines(y = trial.summary.new[[i]], x = trial.summary.new$id, col = area.col[i], lty = 2, lwd = 1)
+  lines(smooth.spline(trial.summary.new$id, trial.summary.new[[i]]), col = area.col[i], lwd = 3)
+}
+
+legend("topright", 
+       legend = colnames(trial.summary.new)[1:n.area], 
+       col = area.col, 
+       lty = 1, 
+       cex = 0.8)
+
+```
+
+SUB has the highest average spike counts. However, there is a decreasing trend as the number of experiments increases. The root region has lower average spike counts and shows horizontal patterns along the trial axis. The spike count of CA3 is the only one that does not show a straight line pattern in this session.
+
+Comparing Session 1 ans Session 18, we can conclude that different sessions have distinct patterns with regard to the overall activity level even for the same brain area. Thus, factors based on brain area may serve as effective predictors because it may reflect the hetergenity across sessions.
+
+# 3. Data Intergration
+
+As we have discussed before, data structure differs across sessions. For instance, Session 1 contains 734 neurons from 8 brain areas, where Session 2 contains 1070 neurons from 5 brain areas. To overcome this challanges, I construct different models based on different factors and samples.
+
+
+- Factor 1: Average total activity level (`avg.spikes`): I calculate the average total activity level across all neurons for specific trials. This factor represents the overall cumulative activity level for all neurons.
+
+- Factor 2: Average maximal activity level (`avg.max.spikes`): I calculate the maximal activity level within the observation window for each neuron and derive the mean across all neurons. This factor represents the average instantaneous peak activity level.
+
+- Factor 3: Average spikes per active neuron (`avg_active_neuron_spks`): I calculate the sum of spikes and active neurons within the observation period and then derive the average spikes per active neuron. This factor represents the overall activity level when neurons are stimulated.
+
+```{r, echo=FALSE}
+session_bench <- data.frame(matrix(ncol = 10, nrow = 0))
+
+# loop through each session
+for (i in 1:length(session)) {
+  n_obs <- length(session[[i]]$feedback_type)
+  mouse_name <- session[[i]]$mouse_name
+  date_exp <- session[[i]]$date_exp
+  n_brain_area <- length(unique(session[[i]]$brain_area))
+
+  # loop through each trail
+  for (j in 1:n_obs) {
+    spks.trial <- session[[i]]$spks[[j]]
+    
+    # total spikes for each neuron
+    total.spikes <- apply(spks.trial, 1, sum)
+    
+    # average spikes per neuron
+    avg.spikes <- mean(total.spikes)
+    
+    total.max.spikes <- apply(spks.trial, 1, max)
+    
+    # average spikes per neuron
+    avg.max.spikes <- mean(total.max.spikes)
+    
+    # average spikes per active neuron
+    active_neurons <- sum(total.spikes > 0)
+    avg.active_neuron_spks <- sum(total.spikes) / active_neurons
+    
+    
+    # create a vector containing the current trial's data
+    current_trial <- c(i, mouse_name, date_exp, session[[i]]$contrast_left[j], session[[i]]$contrast_right[j], n_brain_area, avg.spikes, avg.max.spikes,  avg.active_neuron_spks, session[[i]]$feedback_type[[j]])
+    
+    session_bench <- rbind(session_bench, current_trial)
+  }
+}
+
+# View the results
+colnames(session_bench) <- c("session_ID", "mouse_name", "date_exp", "contrast_left", "contrast_right", "n_brain_area", "avg_spikes","avg_max_spikes", "avg_active_neuron_spks", "feedback_type")
+session_bench$feedback_type <- as.factor(session_bench$feedback_type)
+
+desicions <- c()
+for (j in 1:length(session_bench$contrast_left)){
+  if (session_bench$contrast_left[j] > session_bench$contrast_right[j]){
+      decision = '1' 
+  } else if (session_bench$contrast_left[j] < session_bench$contrast_right[j]){
+      decision = '2' 
+  } else if (session_bench$contrast_left[j] == session_bench$contrast_right[j] 
+             & session_bench$contrast_left[j] == 0){
+      decision = '3' 
+  } else{
+      decision = '4' 
+  }
+  desicions <- cbind(desicions, decision)
+} 
+
+session_bench$desicion <- as.factor(desicions)
+head(session_bench)
+
+```
+
+In summary, I completed the data integration by constructing three different factors. Regardless of which neurons are included in a specific session, we can always calculate these factors and input them into the prediction model. 
+
+# 4. Predictive Modeling
+
+```{r}
+# Set seed for reproducibility
+set.seed(101)
+
+session_bench$feedback_type <- as.numeric(session_bench$feedback_type)
+session_bench$avg_spikes <- as.numeric(session_bench$avg_spikes)
+session_bench$avg_max_spikes <- as.numeric(session_bench$avg_max_spikes)
+session_bench$avg_active_neuron_spks <- as.numeric(session_bench$avg_active_neuron_spks)
+
+# Determine the number of observations in the dataframe
+n_obs <- nrow(session_bench)
+
+# Sample indices for the training set
+train_indices <- sample.int(n = n_obs, size = floor(0.8 * n_obs), replace = FALSE)
+
+# Create the training set using the sampled indices
+train <- session_bench[train_indices, ]
+
+# Create the test set with the remaining indices
+test <- session_bench[-train_indices, ]
+```
+
+## 4.1 Benchmark Naive Data Model
+
+In the benchmark naive data, I use the `feedback_type` as the outcome where `decision`, and `average_spks` as the covariate.
+
+```{r, echo=FALSE}
+
+fit1 <- glm(feedback_type~desicion+avg_spikes, data = train)
+
+summary(fit1)
+```
+
+Model 1 suggests that the avg_spikes variable has a significant positive association with the feedback_type. The other predictor variables, do not show a significant association with the response variable.
+
+```{r, echo=FALSE}
+find_best_threshold <- function(pred, actual, thresholds) {
+  best_threshold <- 0
+  min_error_rate <- Inf
+
+  for (threshold in thresholds) {
+    prediction <- ifelse(pred > threshold, '1', '-1')
+    error_rate <- mean(prediction != actual)
+
+    if (error_rate < min_error_rate) {
+      min_error_rate <- error_rate
+      best_threshold <- threshold
+    }
+  }
+
+  return(list(best_threshold = best_threshold, min_error_rate = min_error_rate))
+}
+
+pred1 <- predict(fit1, test %>% dplyr::select(-feedback_type), type = 'response')
+thresholds <- seq(0.3, 0.8, by = 0.1)
+
+result_1 <- find_best_threshold(pred1, test$feedback_type, thresholds)
+print(paste("Best Threshold:", result_1$best_threshold))
+print(paste("Minimum Error Rate:", result_1$min_error_rate))
+
+```
+
+Use AUC score as the standard to derive the optimal threshold
+
+```{r}
+predicted_prob <- predict(fit1, test, type = "response")
+
+
+roc_obj <- roc(response = test$feedback_type, predictor = predicted_prob)
+auc_score <- pROC::auc(roc_obj)
+
+coords <- coords(roc_obj, "best", best.method = "closest.topleft")
+
+```
+
+## 4.2 Integrated Model
+
+For the next model, I decide to add more variables that related to spikes, such as average spikes in active neurons, and the average maximum spikes.
+
+```{r, echo=FALSE}
+fit2 <- glm(feedback_type~desicion + avg_spikes + avg_active_neuron_spks + avg_max_spikes, data = train)
+summary(fit2)
+```
+
+I fit a logistic regression model on the data frame. The outcome variable is feedback_type, and the covariates included decision, avg_spikes, avg_active_neuron_spks, and avg_max_spks.
+
+```{r}
+
+predicted_prob_2 <- predict(fit2, test, type = "response")
+
+
+roc_obj_2 <- roc(response = test$feedback_type, predictor = predicted_prob_2)
+auc_score_2 <- pROC::auc(roc_obj_2)
+
+coords_2 <- coords(roc_obj_2, "best", best.method = "closest.topleft")
+
+```
+
+# 5. Prediction Performance on The Test Sets
+
+
+```{r, echo=FALSE}
+
+session[[19]]=readRDS(paste('./test1.rds',sep=''))
+
+session[[20]]=readRDS(paste('./test2.rds',sep=''))
+
+
+
+session_bench <- data.frame(matrix(ncol = 10, nrow = 0))
+
+# loop through each session
+for (i in 19:20) {
+  n_obs <- length(session[[i]]$feedback_type)
+  mouse_name <- session[[i]]$mouse_name
+  date_exp <- session[[i]]$date_exp
+  n_brain_area <- length(unique(session[[i]]$brain_area))
+
+  # loop through each trail
+  for (j in 1:n_obs) {
+    spks.trial <- session[[i]]$spks[[j]]
+    
+    # total spikes for each neuron
+    total.spikes <- apply(spks.trial, 1, sum)
+    
+    # average spikes per neuron
+    avg.spikes <- mean(total.spikes)
+    
+    total.max.spikes <- apply(spks.trial, 1, max)
+    
+    # average spikes per neuron
+    avg.max.spikes <- mean(total.max.spikes)
+    
+    # average spikes per active neuron
+    active_neurons <- sum(total.spikes > 0)
+    avg.active_neuron_spks <- sum(total.spikes) / active_neurons
+    
+    
+    # create a vector containing the current trial's data
+    current_trial <- c(i, mouse_name, date_exp, session[[i]]$contrast_left[j], session[[i]]$contrast_right[j], n_brain_area, avg.spikes, avg.max.spikes,  avg.active_neuron_spks, session[[i]]$feedback_type[[j]])
+    
+    session_bench <- rbind(session_bench, current_trial)
+  }
+}
+
+# View the results
+colnames(session_bench) <- c("session_ID", "mouse_name", "date_exp", "contrast_left", "contrast_right", "n_brain_area", "avg_spikes","avg_max_spikes", "avg_active_neuron_spks", "feedback_type")
+session_bench$feedback_type <- as.factor(session_bench$feedback_type)
+
+desicions <- c()
+for (j in 1:length(session_bench$contrast_left)){
+  if (session_bench$contrast_left[j] > session_bench$contrast_right[j]){
+      decision = '1' 
+  } else if (session_bench$contrast_left[j] < session_bench$contrast_right[j]){
+      decision = '2' 
+  } else if (session_bench$contrast_left[j] == session_bench$contrast_right[j] 
+             & session_bench$contrast_left[j] == 0){
+      decision = '3' 
+  } else{
+      decision = '4' 
+  }
+  desicions <- cbind(desicions, decision)
+} 
+
+session_bench$desicion <- as.factor(desicions)
+session_bench$avg_spikes <- as.numeric(session_bench$avg_spikes)
+session_bench$avg_max_spikes <- as.numeric(session_bench$avg_max_spikes)
+session_bench$avg_active_neuron_spks <- as.numeric(session_bench$avg_active_neuron_spks)
+
+
+pred1 <- predict(fit1, session_bench %>% dplyr::select(-feedback_type), type = 'response')
+pred2 <- predict(fit2, session_bench %>% dplyr::select(-feedback_type), type = 'response')
+
+```
+
+## 5.1 Model 1 Performance Analysis
+
+```{r, echo=FALSE}
+
+prediction1 <- as.factor(ifelse(pred1 > coords$threshold , 1, -1))
+
+cm <- confusionMatrix(prediction1, session_bench$feedback_type, dnn = c("Prediction", "Reference"))
+
+plt <- as.data.frame(cm$table)
+
+ggplot(plt, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#009194") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("-1","1")) +
+        scale_y_discrete(labels=c("-1","1"))
+
+```
+
+The False Negative Rate is high in Model 1.
+
+## 5.2 Model 2 Performance Analysis
+
+
+```{r, echo=FALSE}
+prediction2 <- as.factor(ifelse(pred2 > coords_2$threshold, '1', '-1'))
+cm <- confusionMatrix(prediction2, session_bench$feedback_type, dnn = c("Prediction","Reference"))
+
+plt <- as.data.frame(cm$table)
+
+ggplot(plt, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#009194") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("-1","1")) +
+        scale_y_discrete(labels=c("-1","1"))
+```
+
+Model 2 has a slightly better False Negative rate.
+
+## 5.3 ROC Curve 
+
+```{r, echo=FALSE}
+# Model 1
+pr = prediction(pred1, session_bench$feedback_type)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+
+# Model 2
+pr = prediction(pred2, session_bench$feedback_type)
+prf2 <- performance(pr, measure = "tpr", x.measure = "fpr")
+auc2 <- performance(pr, measure = "auc")
+auc2 <- auc2@y.values[[1]]
+
+# Bias Guess
+pred0 = pred1 * 0 + 1
+pr = prediction(pred0, session_bench$feedback_type)
+prf0 <- performance(pr, measure = "tpr", x.measure = "fpr")
+auc0 <- performance(pr, measure = "auc")
+auc0 <- auc0@y.values[[1]]
+
+plot(prf2, ,col = 'red', main = 'ROC curve')
+plot(prf, add = TRUE, col = 'blue')
+plot(prf0, add = TRUE, col = 'green')
+legend("bottomright", legend=c("Model 1", "Model 2", "Bias Guess"), col=c("blue", "red", 'green'), lty=1:1, 
+       cex=0.8)
+```
+
+From ROC curve, we see that Mode 1 and Model 2 have similar performance in test data.
+
+```{r, echo=FALSE}
+# AUC 
+print(c(auc, auc2, auc0))
+
+```
+
+From AUC, Model 1 is slightly better than Model 2 in test data.
+
+# 6. Conclusion and Discussion
+
+In conclusion, Model 1 and Model 2 have similar performance on the test data, Model 1 is slightly better on predicting random choose trials than Model 2.
+
+There are still several drawbacks and potential directions for my project: 
+
+-   More factors could be constructed for refined analysis.
+
+-   We could use oversampling or subsampling techniques to address the imbalanced dataset issue.
+
+-   Clustering techniques could be used to uncover the latent factors related to neural activity.
+
+# Acknowledgement {-}
+[ChatGPT conversation](https://chat.openai.com/c/9bdd7668-94ef-4227-8355-acdc36f3c148)
+
+# Reference {.unnumbered}
+
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266--273 (2019). <https://doi.org/10.1038/s41586-019-1787-x>
